@@ -197,7 +197,7 @@
         </div>
 
         <!-- Custom Date Range -->
-        <div id="customDateBox" class="hidden grid grid-cols-2 gap-2 pt-1">
+        <div id="customDateBox" class="hidden grid-cols-2 gap-2 pt-1">
           <div>
             <label class="text-[10px] text-slate-400 block mb-1">Dari Tanggal</label>
             <input type="date" id="dateFrom" onchange="onHistoryFilterChange(true)" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-2 text-xs text-white focus:outline-none focus:border-emerald-500" />
@@ -338,6 +338,28 @@
     </div>
   </div>
 
+  <!-- Modal Konfirmasi Hapus Transaksi -->
+  <div id="deleteModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
+    <div class="bg-slate-900 border border-rose-500/30 rounded-3xl p-5 w-full max-w-sm space-y-4 shadow-2xl">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-2xl bg-rose-500/15 text-rose-400 flex items-center justify-center text-lg shrink-0">🗑️</div>
+        <div>
+          <h3 class="font-bold text-sm text-white">Hapus Transaksi Ini?</h3>
+          <p class="text-[11px] text-slate-400">Baris akan dihapus permanen & saldo otomatis diperbarui.</p>
+        </div>
+      </div>
+
+      <div id="deletePreview" class="bg-slate-950 border border-slate-800 rounded-2xl p-3 text-xs space-y-1"></div>
+
+      <div class="flex justify-end gap-2">
+        <button onclick="closeDeleteModal()" id="cancelDeleteBtn" class="px-4 py-2.5 rounded-xl text-xs font-semibold text-slate-400 hover:text-white">Batal</button>
+        <button onclick="confirmDelete()" id="confirmDeleteBtn" class="px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-xs transition active:scale-95">
+          Ya, Hapus
+        </button>
+      </div>
+    </div>
+  </div>
+
   <script>
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js');
 
@@ -386,6 +408,7 @@
     let selectedCategory = 'Makan & Kopi';
     let historyTypeFilter = 'Semua';
     let historyLimit = 15;
+    let pendingDeleteItem = null;
     let isHidden = localStorage.getItem('ukukas_privacy') === 'true';
     let appData = { totalBalance: 0, balances: {}, transactions: [] };
 
@@ -396,6 +419,38 @@
     const pad2 = (n) => String(n).padStart(2, '0');
     const toYMD = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     const toYM  = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+
+    // Smart Date Extractor: menangani YYYY-MM-DD, ISO UTC, DD/MM/YYYY, dll.
+    function extractYMD(raw) {
+      const str = String(raw || '').trim();
+      if (!str) return '';
+
+      if (/^\d{4}-\d{2}-\d{2}T/i.test(str)) {
+        const d = new Date(str);
+        if (!isNaN(d.getTime())) return toYMD(d);
+      }
+
+      const ymd = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+      if (ymd) return `${ymd[1]}-${pad2(ymd[2])}-${pad2(ymd[3])}`;
+
+      const dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (dmy) {
+        let p1 = Number(dmy[1]), p2 = Number(dmy[2]);
+        let dd = p1, mm = p2;
+        if (p2 > 12 && p1 <= 12) { mm = p1; dd = p2; }
+        return `${dmy[3]}-${pad2(mm)}-${pad2(dd)}`;
+      }
+
+      const d = new Date(str);
+      if (!isNaN(d.getTime())) return toYMD(d);
+      return '';
+    }
+
+    function extractYM(raw) {
+      const ymd = extractYMD(raw);
+      return ymd ? ymd.slice(0, 7) : '';
+    }
+
     const formatMonthLabel = (ym) => {
       if (ym === 'ALL') return 'Semua Waktu';
       const [y, m] = ym.split('-');
@@ -417,7 +472,9 @@
       return String(num);
     };
 
-    // Current month badge
+    const escapeHtml = (str) => String(str || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
     const nowDate = new Date();
     const currentYM = toYM(nowDate);
     document.getElementById('monthLabel').innerText = formatMonthLabel(currentYM);
@@ -428,11 +485,9 @@
       ['home', 'history', 'analytics'].forEach(t => {
         document.getElementById('view-' + t).classList.toggle('hidden', t !== tab);
         const btn = document.getElementById('nav-' + t);
-        if (t === tab) {
-          btn.className = 'nav-btn flex flex-col items-center justify-center py-1.5 rounded-2xl transition text-emerald-400 bg-emerald-500/10';
-        } else {
-          btn.className = 'nav-btn flex flex-col items-center justify-center py-1.5 rounded-2xl transition text-slate-400 hover:text-slate-200';
-        }
+        btn.className = t === tab
+          ? 'nav-btn flex flex-col items-center justify-center py-1.5 rounded-2xl transition text-emerald-400 bg-emerald-500/10'
+          : 'nav-btn flex flex-col items-center justify-center py-1.5 rounded-2xl transition text-slate-400 hover:text-slate-200';
       });
 
       const subtitles = {
@@ -490,6 +545,67 @@
       loadData(true);
     }
 
+    // === DELETE MODAL & HANDLER ===
+    function openDeleteModal(idx) {
+      const item = appData.transactions[idx];
+      if (!item) return;
+      pendingDeleteItem = item;
+
+      const title = item.tipe === 'Pindah Saldo' ? `${item.dompet} → ${item.tujuan}` : `${item.kategori} (${item.dompet})`;
+      document.getElementById('deletePreview').innerHTML = `
+        <div class="font-bold text-white">${escapeHtml(title)}</div>
+        <div class="text-rose-400 font-extrabold text-sm">Rp ${Number(item.nominal || 0).toLocaleString('id-ID')}</div>
+        <div class="text-[11px] text-slate-400">${escapeHtml(item.catatan || 'Tanpa catatan')} • ${escapeHtml(item.tanggal)}</div>
+      `;
+
+      document.getElementById('deleteModal').classList.remove('hidden');
+      document.getElementById('deleteModal').classList.add('flex');
+    }
+
+    function closeDeleteModal() {
+      pendingDeleteItem = null;
+      document.getElementById('deleteModal').classList.add('hidden');
+      document.getElementById('deleteModal').classList.remove('flex');
+    }
+
+    async function confirmDelete() {
+      if (!pendingDeleteItem) return;
+      const url = getApiUrl();
+      if (!url) return openSettings();
+
+      const btn = document.getElementById('confirmDeleteBtn');
+      const cancelBtn = document.getElementById('cancelDeleteBtn');
+      btn.disabled = true;
+      cancelBtn.disabled = true;
+      btn.innerText = 'Menghapus...';
+
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'delete',
+            id: pendingDeleteItem.id,
+            rowIndex: pendingDeleteItem.rowIndex
+          })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+          applyServerData(data);
+          closeDeleteModal();
+          showToast('Transaksi berhasil dihapus 🗑️', 'info');
+        } else {
+          showToast(data.message || 'Gagal menghapus transaksi', 'error');
+        }
+      } catch (err) {
+        showToast('Gagal menghapus. Pastikan Apps Script sudah di-deploy versi baru.', 'error');
+      } finally {
+        btn.disabled = false;
+        cancelBtn.disabled = false;
+        btn.innerText = 'Ya, Hapus';
+      }
+    }
+
     // === FORM HELPERS ===
     function updateNominalPreview() {
       const val = Number(document.getElementById('nominal').value || 0);
@@ -515,9 +631,7 @@
       document.getElementById('histWallet').innerHTML =
         `<option value="ALL">Semua Dompet</option>` + walletOpts;
 
-      // Default custom date inputs to current month
-      const firstDay = `${currentYM}-01`;
-      document.getElementById('dateFrom').value = firstDay;
+      document.getElementById('dateFrom').value = `${currentYM}-01`;
       document.getElementById('dateTo').value = toYMD(nowDate);
     }
 
@@ -612,8 +726,9 @@
       renderCategoryChips();
     }
 
-    // === SHARED TRANSACTION ITEM TEMPLATE ===
+    // === SHARED TRANSACTION CARD (DENGAN TOMBOL HAPUS) ===
     function renderTransactionCard(item) {
+      const idx = item._idx;
       const isIn = item.tipe === 'Pemasukan';
       const isOut = item.tipe === 'Pengeluaran';
       const color = isIn ? 'text-emerald-400' : isOut ? 'text-rose-400' : 'text-sky-400';
@@ -624,19 +739,25 @@
       const subWallet = item.tipe === 'Pindah Saldo' ? 'Pindah Saldo' : item.dompet;
 
       return `
-        <div class="bg-slate-900/80 border border-slate-800/80 rounded-2xl p-3 flex items-center justify-between gap-3">
+        <div class="bg-slate-900/80 border border-slate-800/80 rounded-2xl p-3 flex items-center justify-between gap-2.5">
           <div class="flex items-center gap-3 min-w-0">
             <div class="w-10 h-10 rounded-xl ${iconBg} flex items-center justify-center text-base shrink-0">${icon}</div>
             <div class="min-w-0">
-              <div class="font-bold text-xs text-white truncate">${title}</div>
+              <div class="font-bold text-xs text-white truncate">${escapeHtml(title)}</div>
               <div class="text-[11px] text-slate-400 truncate mt-0.5">
-                <span class="text-slate-300 font-medium">${subWallet}</span>${item.catatan ? ' • ' + item.catatan : ''}
+                <span class="text-slate-300 font-medium">${escapeHtml(subWallet)}</span>${item.catatan ? ' • ' + escapeHtml(item.catatan) : ''}
               </div>
-              <div class="text-[10px] text-slate-500 mt-0.5">${item.tanggal}</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">${escapeHtml(item.tanggal)}</div>
             </div>
           </div>
-          <div class="font-extrabold text-xs ${color} whitespace-nowrap shrink-0">
-            ${sign} ${formatRp(item.nominal)}
+          <div class="flex items-center gap-2 shrink-0">
+            <div class="font-extrabold text-xs ${color} whitespace-nowrap">
+              ${sign} ${formatRp(item.nominal)}
+            </div>
+            <button type="button" onclick="openDeleteModal(${idx})" title="Hapus Transaksi"
+              class="w-7 h-7 rounded-lg bg-slate-950/80 border border-slate-800 hover:border-rose-500/50 hover:bg-rose-500/10 text-slate-500 hover:text-rose-400 flex items-center justify-center text-xs active:scale-90 transition">
+              🗑️
+            </button>
           </div>
         </div>`;
     }
@@ -663,7 +784,7 @@
       const trx = appData.transactions || [];
       let mIn = 0, mOut = 0;
       trx.forEach(item => {
-        if ((item.tanggal || '').startsWith(currentYM)) {
+        if (extractYM(item.tanggal) === currentYM) {
           if (item.tipe === 'Pemasukan') mIn += Number(item.nominal || 0);
           if (item.tipe === 'Pengeluaran') mOut += Number(item.nominal || 0);
         }
@@ -693,8 +814,10 @@
 
     function onHistoryFilterChange(resetLimit = false) {
       if (resetLimit) historyLimit = 15;
-      const period = document.getElementById('histPeriod').value;
-      document.getElementById('customDateBox').classList.toggle('hidden', period !== 'custom');
+      const isCustom = document.getElementById('histPeriod').value === 'custom';
+      const box = document.getElementById('customDateBox');
+      box.classList.toggle('hidden', !isCustom);
+      box.classList.toggle('grid', isCustom);
       renderHistory();
     }
 
@@ -708,7 +831,6 @@
       const walletFlt = document.getElementById('histWallet').value;
       const query = document.getElementById('histSearch').value.trim().toLowerCase();
 
-      // Calculate date range bounds (YYYY-MM-DD)
       let fromDate = null, toDate = null;
       const today = new Date();
 
@@ -736,9 +858,12 @@
       }
 
       const filtered = (appData.transactions || []).filter(item => {
-        const itemDate = (item.tanggal || '').slice(0, 10);
-        if (fromDate && itemDate < fromDate) return false;
-        if (toDate && itemDate > toDate) return false;
+        const itemDate = extractYMD(item.tanggal);
+        if (period !== 'all') {
+          if (!itemDate) return false;
+          if (fromDate && itemDate < fromDate) return false;
+          if (toDate && itemDate > toDate) return false;
+        }
         if (historyTypeFilter !== 'Semua' && item.tipe !== historyTypeFilter) return false;
         if (walletFlt !== 'ALL' && item.dompet !== walletFlt && item.tujuan !== walletFlt) return false;
         if (query) {
@@ -784,9 +909,14 @@
       const select = document.getElementById('chartMonthSelect');
       const prevValue = select.value;
       const monthSet = new Set([currentYM]);
+      const dataMonths = new Set();
+
       (appData.transactions || []).forEach(item => {
-        const ym = (item.tanggal || '').slice(0, 7);
-        if (/^\d{4}-\d{2}$/.test(ym)) monthSet.add(ym);
+        const ym = extractYM(item.tanggal);
+        if (/^\d{4}-\d{2}$/.test(ym)) {
+          monthSet.add(ym);
+          dataMonths.add(ym);
+        }
       });
 
       const sortedMonths = Array.from(monthSet).sort().reverse();
@@ -796,6 +926,10 @@
 
       if (prevValue && (sortedMonths.includes(prevValue) || prevValue === 'ALL')) {
         select.value = prevValue;
+      } else if (dataMonths.has(currentYM)) {
+        select.value = currentYM;
+      } else if (dataMonths.size > 0) {
+        select.value = Array.from(dataMonths).sort().reverse()[0];
       } else {
         select.value = currentYM;
       }
@@ -806,7 +940,7 @@
       const allTrx = appData.transactions || [];
       const periodTrx = selectedYM === 'ALL'
         ? allTrx
-        : allTrx.filter(i => (i.tanggal || '').startsWith(selectedYM));
+        : allTrx.filter(i => extractYM(i.tanggal) === selectedYM);
 
       let totalIn = 0, totalOut = 0;
       const catTotals = {};
@@ -905,7 +1039,7 @@
               <div class="flex justify-between items-center text-xs">
                 <span class="font-semibold text-slate-200 flex items-center gap-1.5">
                   <span class="w-2.5 h-2.5 rounded-full inline-block" style="background:${color}"></span>
-                  ${icon} ${cat}
+                  ${icon} ${escapeHtml(cat)}
                 </span>
                 <span class="font-bold text-white">
                   ${formatRp(amt)} <span class="text-[10px] font-medium text-slate-400">(${pct}%)</span>
@@ -926,11 +1060,11 @@
       }
 
       const trendIn = last6Months.map(ym =>
-        allTrx.filter(t => t.tipe === 'Pemasukan' && (t.tanggal || '').startsWith(ym))
+        allTrx.filter(t => t.tipe === 'Pemasukan' && extractYM(t.tanggal) === ym)
               .reduce((s, t) => s + Number(t.nominal || 0), 0)
       );
       const trendOut = last6Months.map(ym =>
-        allTrx.filter(t => t.tipe === 'Pengeluaran' && (t.tanggal || '').startsWith(ym))
+        allTrx.filter(t => t.tipe === 'Pengeluaran' && extractYM(t.tanggal) === ym)
               .reduce((s, t) => s + Number(t.nominal || 0), 0)
       );
 
@@ -991,7 +1125,17 @@
       });
     }
 
-    // === MASTER RENDER ===
+    // === MASTER DATA & RENDER ===
+    function applyServerData(data) {
+      const list = (data.transactions || data.recent || []).map((item, i) => ({ ...item, _idx: i }));
+      appData = {
+        totalBalance: data.totalBalance || 0,
+        balances: data.balances || {},
+        transactions: list
+      };
+      renderAll();
+    }
+
     function renderAll() {
       populateChartMonths();
       renderHome();
@@ -1010,13 +1154,7 @@
         const res = await fetch(url);
         const data = await res.json();
         if (data.status === 'success') {
-          // Support both v3 (transactions) and fallback v2 (recent)
-          appData = {
-            totalBalance: data.totalBalance || 0,
-            balances: data.balances || {},
-            transactions: data.transactions || data.recent || []
-          };
-          renderAll();
+          applyServerData(data);
           if (notify) showToast('Data tersinkronisasi', 'info');
         } else {
           showToast(data.message || 'Gagal memuat data', 'error');
@@ -1064,16 +1202,8 @@
         });
         try {
           const data = await res.json();
-          if (data.status === 'success') {
-            appData = {
-              totalBalance: data.totalBalance || 0,
-              balances: data.balances || {},
-              transactions: data.transactions || data.recent || []
-            };
-            renderAll();
-          } else {
-            await loadData();
-          }
+          if (data.status === 'success') applyServerData(data);
+          else await loadData();
         } catch {
           await loadData();
         }
